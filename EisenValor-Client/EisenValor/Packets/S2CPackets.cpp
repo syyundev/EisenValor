@@ -45,11 +45,11 @@
 
 using namespace NetBridge;
 
-namespace
-{
-	std::unordered_map<uint64, uint8_t> s_pendingStateByObjectID;
-	uint8 s_latestRedScore = 0;
-	uint8 s_latestBlueScore = 0;
+	namespace
+	{
+		std::unordered_map<uint64, uint8_t> s_pendingStateByObjectID;
+		uint8 s_latestRedScore = 0;
+		uint8 s_latestBlueScore = 0;
 	bool s_hasLatestAttackReaction = false;
 	uint64 s_latestAttackAttackerID = 0;
 	uint8_t s_latestAttackType = 0;
@@ -85,8 +85,8 @@ namespace
 		s_pendingStateByObjectID.erase(iter);
 	}
 
-	TextUIComponent* FindRemainingTimeText(Scene* scene)
-	{
+		TextUIComponent* FindRemainingTimeText(Scene* scene)
+		{
 		if (!scene)
 		{
 			return nullptr;
@@ -1461,10 +1461,22 @@ bool NetBridge::S2C::Handle_SC_MOVE_PACKET(const SOCKET& socket, const FB_TABLES
 	const Vec3 pos{recvPkt.pos_info()->pos().x(), recvPkt.pos_info()->pos().y(), recvPkt.pos_info()->pos().z()};
 	const Vec3 rot{recvPkt.pos_info()->rot().x(), recvPkt.pos_info()->rot().y(), recvPkt.pos_info()->rot().z()};
 	auto*	   fsm = obj->GetComponent<FSMComponent>();
-
+	
+	// Soldier가 죽은 상태일 때는 이동 패킷을 무시
 	if (fsm &&
 		fsm->GetObjectType() == static_cast<uint8_t>(FB_ENUMS::GAME_OBJECT_TYPE_SOLDIER) &&
 		fsm->GetCurStateType() == StateOffset::kSoldierOffset + static_cast<uint8_t>(FB_ENUMS::SOLDIER_STATE_TYPE_DEAD))
+	{
+		return true;
+	}
+	
+	// guard, stun dead: 이동 패킷을 무시
+	if (fsm &&
+		(fsm->GetCurStateType() == static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_GUARD) ||
+		 fsm->GetCurStateType() == static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_STUN) ||
+		 fsm->GetCurStateType() == static_cast<uint8_t>(FB_ENUMS::GENERAL_STATE_TYPE_STUN) ||
+		 fsm->GetCurStateType() == static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_DEAD) ||
+		 fsm->GetCurStateType() == static_cast<uint8_t>(FB_ENUMS::GENERAL_STATE_TYPE_DEAD)))
 	{
 		return true;
 	}
@@ -1528,28 +1540,30 @@ bool NetBridge::S2C::Handle_SC_GENERAL_ATTACK_PACKET(
 	}
 
 	// 1. 공격자 오브젝트 찾기
-	if (auto* obj = scene->FindGameObjectByServerID(id))
+		if (auto* obj = scene->FindGameObjectByServerID(id))
 	{
 		// 2. 컴포넌트 가져오기
 		if (auto* uiController = obj->GetComponent<BattleUIControllerComponent>())
 		{
-			// UI 갱신
-			uiController->TriggerAttackRemote(type, dir);
-			// DEBUG_LOG_FMT("[SC_PLAYER_ATTACK] ID: {}, Type: {}, Dir: {}\n", id, static_cast<int>(type),
-			// static_cast<int>(dir));
 
 			// FSM 상태 동기화: 공격 타입 설정
 			if (auto* fsm = obj->GetComponent<FSMComponent>())
 			{
 				fsm->SetCurAttackType(static_cast<GENERAL_ATTACK_TYPE>(type));
+				// 안전장치
+				fsm->SetCurAttackDir(static_cast<uint8_t>(dir));
 				const auto objectType = fsm->GetObjectType();
-				if (
-					objectType == static_cast<uint8_t>(FB_ENUMS::GAME_OBJECT_TYPE_GENERAL))
+				if (objectType == static_cast<uint8_t>(FB_ENUMS::GAME_OBJECT_TYPE_GENERAL))
 				{
 					fsm->ChangeState(FB_ENUMS::PLAYER_STATE_TYPE_PRE_DELAY);
 				}
 			}
 			return true;
+
+			// UI 갱신
+			uiController->TriggerAttackRemote(type, dir);
+			// DEBUG_LOG_FMT("[SC_PLAYER_ATTACK] ID: {}, Type: {}, Dir: {}\n", id, static_cast<int>(type),
+			// static_cast<int>(dir));
 		}
 	}
 
@@ -1711,18 +1725,19 @@ bool NetBridge::S2C::Handle_SC_UPDATE_STATE_PACKET(
 		{
 			return true;
 		}
-		if (s_hasLatestAttackReaction &&
-			(nextState == FB_ENUMS::PLAYER_STATE_TYPE_STUN || nextState == FB_ENUMS::GENERAL_STATE_TYPE_STUN))
+		if (nextState == FB_ENUMS::PLAYER_STATE_TYPE_STUN || nextState == FB_ENUMS::GENERAL_STATE_TYPE_STUN)
 		{
-			fsm->SetCurAttackType(s_latestAttackType);
-			fsm->SetCurAttackDir(s_latestAttackDir);
-			/*DEBUG_LOG_FMT(
-				"[HitReactSource] victim={}, attacker={}, attackType={}, attackDir={}\n",
-				objID,
-				s_latestAttackAttackerID,
-				static_cast<int>(s_latestAttackType),
-				static_cast<int>(s_latestAttackDir)
-			);*/
+			if (s_hasLatestAttackReaction)
+			{
+				fsm->SetHitReact(s_latestAttackType, s_latestAttackDir);
+				/*DEBUG_LOG_FMT(
+					"[HitReactSource] victim={}, attacker={}, attackType={}, attackDir={}\n",
+					objID,
+					s_latestAttackAttackerID,
+					static_cast<int>(s_latestAttackType),
+					static_cast<int>(s_latestAttackDir)
+				);*/
+			}
 		}
 		fsm->SetServerState(nextState);
 		//DEBUG_LOG_FMT(
@@ -2004,6 +2019,20 @@ bool NetBridge::S2C::Handle_SC_GENERAL_GUARD_PACKET(
 
 	const uint64 defenderID = recvPkt.defender_id();
 	const uint64 attackerID = recvPkt.attacker_id();
+	auto* attackerObj = scene->FindGameObjectByServerID(attackerID);
+	auto* attackerFsm = attackerObj ? attackerObj->GetComponent<FSMComponent>() : nullptr;
+	if (!attackerFsm)
+	{
+		return true;
+	}
+
+	const uint8_t attackerState = attackerFsm->GetCurStateType();	
+	// 공격자가 선딜이거나 attack 일 때만 guard 정정 적용
+	if (attackerState != static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_PRE_DELAY) &&
+		attackerState != static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_ATTACK))
+	{
+		return true;
+	}
 
 	if (auto* defenderObj = scene->FindGameObjectByServerID(defenderID))
 	{
@@ -2017,16 +2046,13 @@ bool NetBridge::S2C::Handle_SC_GENERAL_GUARD_PACKET(
 		}
 	}
 
-	if (auto* attackerObj = scene->FindGameObjectByServerID(attackerID))
+	if (attackerObj)
 	{
-		if (auto* fsm = attackerObj->GetComponent<FSMComponent>())
-		{
-			fsm->SetGuardRole(FSMComponent::GuardRole::Attacker);
-			fsm->RequestState(
-				FSMComponent::StateRequestType::Guard,
-				static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_GUARD)
-			);
-		}
+		attackerFsm->SetGuardRole(FSMComponent::GuardRole::Attacker);
+		attackerFsm->RequestState(
+			FSMComponent::StateRequestType::Guard,
+			static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_GUARD)
+		);
 	}
 
 	return true;
@@ -2034,13 +2060,6 @@ bool NetBridge::S2C::Handle_SC_GENERAL_GUARD_PACKET(
 
 bool NetBridge::S2C::Handle_SC_HIT_SOUND_PACKET(const SOCKET& socket, const FB_TABLES::SC_HIT_SOUND_PACKET& recvPkt)
 {
-	const auto attackerID{recvPkt.attacker_id()};
-	auto* scene = GLOBAL(SceneGlobal).GetActiveScene();
-	if (scene && attackerID == scene->GetLocalID())
-	{
-		GLOBAL(AudioGlobal).Play2D(L"Resource/Sounds/sword_hurt.wav", AudioBus::SFX);
-	}
-
 	return true;
 }
 
