@@ -38,6 +38,7 @@
 #include "Component/SocketComponent.h"
 #include "Component/AttackRangeDebugComponent.h"
 #include "Component/FootIKComponent.h"
+#include "Component/Lobby/LobbyClientState.h"
 #include "Scene/ScoreScene.h"
 #include "ResourceGlobal.h"
 #include "MeshResource.h"
@@ -45,76 +46,84 @@
 
 using namespace NetBridge;
 
-	namespace
+namespace
+{
+std::unordered_map<uint64, uint8_t> s_pendingStateByObjectID;
+std::unordered_map<uint64, uint8_t> s_occupationZoneSlotByObjectID;
+uint8								s_latestRedScore = 0;
+uint8								s_latestBlueScore = 0;
+bool								s_hasLatestAttackReaction = false;
+uint64								s_latestAttackAttackerID = 0;
+uint8_t								s_latestAttackType = 0;
+uint8_t								s_latestAttackDir = 0;
+
+RoomParticipantView MakeParticipantView(const FB_STRUCTS::ParticipantInfo& participant)
+{
+	return {participant.id(), participant.type(), participant.state_type(), participant.team_type()};
+}
+
+void NotifyOccupationZoneReached(Scene* scene)
+{
+	if (!scene)
 	{
-		std::unordered_map<uint64, uint8_t> s_pendingStateByObjectID;
-		uint8 s_latestRedScore = 0;
-		uint8 s_latestBlueScore = 0;
-	bool s_hasLatestAttackReaction = false;
-	uint64 s_latestAttackAttackerID = 0;
-	uint8_t s_latestAttackType = 0;
-	uint8_t s_latestAttackDir = 0;
-
-	void NotifyOccupationZoneReached(Scene* scene)
-	{
-		if (!scene)
-		{
-			return;
-		}
-
-		auto* localPlayer = scene->FindGameObjectByServerID(scene->GetLocalID());
-		if (!localPlayer)
-		{
-			return;
-		}
-
-		if (auto* quest = localPlayer->GetComponent<QuestProgressComponent>())
-		{
-			quest->SetOccupationZoneReached(true);
-		}
+		return;
 	}
 
-	void ApplyPendingServerState(uint64 objID, FSMComponent* fsm)
+	auto* localPlayer = scene->FindGameObjectByServerID(scene->GetLocalID());
+	if (!localPlayer)
 	{
-		if (!fsm) return;
-
-		auto iter = s_pendingStateByObjectID.find(objID);
-		if (iter == s_pendingStateByObjectID.end()) return;
-
-		fsm->SetServerState(iter->second);
-		s_pendingStateByObjectID.erase(iter);
+		return;
 	}
 
-		TextUIComponent* FindRemainingTimeText(Scene* scene)
-		{
-		if (!scene)
-		{
-			return nullptr;
-		}
-
-		auto* textStorage = scene->GetStorage<TextUIComponent>();
-		if (!textStorage)
-		{
-			return nullptr;
-		}
-
-		for (auto& text : textStorage->GetList())
-		{
-			auto* owner = text.GetGameObject();
-			if (!owner)
-			{
-				continue;
-			}
-
-			if (owner->GetName() == "RemainingTimeText")
-			{
-				return &text;
-			}
-		}
-
-		return nullptr;
+	if (auto* quest = localPlayer->GetComponent<QuestProgressComponent>())
+	{
+		quest->SetOccupationZoneReached(true);
 	}
 }
+
+void ApplyPendingServerState(uint64 objID, FSMComponent* fsm)
+{
+	if (!fsm)
+		return;
+
+	auto iter = s_pendingStateByObjectID.find(objID);
+	if (iter == s_pendingStateByObjectID.end())
+		return;
+
+	fsm->SetServerState(iter->second);
+	s_pendingStateByObjectID.erase(iter);
+}
+
+TextUIComponent* FindRemainingTimeText(Scene* scene)
+{
+	if (!scene)
+	{
+		return nullptr;
+	}
+
+	auto* textStorage = scene->GetStorage<TextUIComponent>();
+	if (!textStorage)
+	{
+		return nullptr;
+	}
+
+	for (auto& text : textStorage->GetList())
+	{
+		auto* owner = text.GetGameObject();
+		if (!owner)
+		{
+			continue;
+		}
+
+		if (owner->GetName() == "RemainingTimeText")
+		{
+			return &text;
+		}
+	}
+
+	return nullptr;
+}
+} // namespace
 
 bool NetBridge::S2C::Handle_Invalid(const SOCKET&, const char* const, const PacketHeader&)
 {
@@ -185,6 +194,7 @@ bool NetBridge::S2C::Handle_LC_ENTER_GAME_LOBBY_FAIL_PACKET(
 {
 	DEBUG_LOG_FMT("[SC_ENTER_GAME_LOBBY_FAIL_PACKET] ");
 	DEBUG_LOG_FMT("Fail Reason: {}\n", recvPkt.fail_msg()->c_str());
+	GLOBAL(LobbyClientState).SetStatusMessage(recvPkt.fail_msg()->str());
 
 	return true;
 }
@@ -197,28 +207,36 @@ bool NetBridge::S2C::Handle_LC_ENTER_GAME_LOBBY_SUCCESS_PACKET(
 	const auto& rooms = recvPkt.rooms();
 	const auto& users = recvPkt.users();
 	const auto& vecUserID = recvPkt.vec_user_id();
+	auto&		lobbyState = GLOBAL(LobbyClientState);
+	lobbyState.ResetLobby();
+	lobbyState.ReserveLobby(rooms ? rooms->size() : 0, users ? users->size() : 0);
 
-	if (rooms == nullptr)
+	if (rooms != nullptr)
 	{
-		return true;
+		for (const auto* room : *rooms)
+		{
+			lobbyState.AddOrUpdateRoom(
+				{room->id(), room->state(), room->current_participants(), room->max_marticipants()}
+			);
+			DEBUG_LOG_FMT("Room ID: {}\n", room->id());
+		}
+
+		if (rooms->empty())
+		{
+			std::cout << "Zero Room" << std::endl;
+		}
 	}
 
-	// 로비에 성공적으로 입장
-	// TODO: 로비 씬 안에서 방 목록 및 유저 목록을 화면에 보여주기
-
-	for (const auto* room : *rooms)
+	if (users && vecUserID)
 	{
-		auto roomId = room->id();
-		DEBUG_LOG_FMT("Room ID: {}\n", roomId);
-	}
-
-	if (rooms->size() == 0)
-		std::cout << "Zero Room" << std::endl;
-
-	for (flatbuffers::uoffset_t i = 0; i < users->size(); ++i)
-	{
-		const auto* user = users->Get(i);
-		DEBUG_LOG_FMT("-Name:{}, ID:{}\n", user->c_str(), vecUserID->Get(i));
+		const auto userCount = std::min(users->size(), vecUserID->size());
+		for (flatbuffers::uoffset_t i = 0; i < userCount; ++i)
+		{
+			const auto*	 user = users->Get(i);
+			const uint32 userID = vecUserID->Get(i);
+			lobbyState.AddOrUpdateUser(userID, user->str());
+			DEBUG_LOG_FMT("-Name:{}, ID:{}\n", user->c_str(), userID);
+		}
 	}
 
 	// auto pb = NetBridge::C2S::Make_CS_JOIN_GAME_ROOM_PACKET(1000);
@@ -249,6 +267,7 @@ bool NetBridge::S2C::Handle_LC_ENTER_USER_IN_GAME_LOBBY_PACKET(
 
 	DEBUG_LOG_FMT("[SC_ENTER_USER_IN_GAME_LOBBY_PACKET] ");
 	DEBUG_LOG_FMT("User Name: {}\n", recvPkt.user_name()->c_str());
+	GLOBAL(LobbyClientState).AddOrUpdateUser(recvPkt.user_id(), recvPkt.user_name()->str());
 
 	return true;
 }
@@ -262,7 +281,8 @@ bool NetBridge::S2C::Handle_LC_LEAVE_USER_IN_GAME_LOBBY_PACKET(
 	// TODO: 로비에서 유저가 퇴장했음을 화면에 보여주기
 	DEBUG_LOG_FMT("[SC_REMOVE_USER_IN_GAME_LOBBY_PACKET] ");
 	DEBUG_LOG_FMT("Remove User In Lobby! id = {}\n", recvPkt.user_id());
-	return false;
+	GLOBAL(LobbyClientState).RemoveUser(recvPkt.user_id());
+	return true;
 }
 
 bool NetBridge::S2C::Handle_LC_MAKE_GAME_ROOM_PACKET(
@@ -274,6 +294,10 @@ bool NetBridge::S2C::Handle_LC_MAKE_GAME_ROOM_PACKET(
 	DEBUG_LOG_FMT("[SC_MAKE_GAME_ROOM_PACKET] ");
 	const auto& roomInfo = recvPkt.room_info();
 	DEBUG_LOG_FMT("Room ID: {}\n", roomInfo->id());
+	GLOBAL(LobbyClientState)
+		.AddOrUpdateRoom(
+			{roomInfo->id(), roomInfo->state(), roomInfo->current_participants(), roomInfo->max_marticipants()}
+		);
 	return true;
 }
 #pragma endregion
@@ -287,6 +311,7 @@ bool NetBridge::S2C::Handle_LC_ENTER_GAME_ROOM_FAIL_PACKET(
 	// TODO: 게임 룸 입장 실패 메시지 화면에 보여주기
 	DEBUG_LOG_FMT("[SC_JOIN_GAME_ROOM_FAIL_PACKET] ");
 	DEBUG_LOG_FMT("Fail Reason: {}\n", recvPkt.fail_msg()->c_str());
+	GLOBAL(LobbyClientState).SetStatusMessage(recvPkt.fail_msg()->str());
 	return true;
 }
 
@@ -301,6 +326,12 @@ bool NetBridge::S2C::Handle_LC_ENTER_GAME_ROOM_SUCCESS_PACKET(
 
 	DEBUG_LOG_FMT("[SC_JOIN_GAME_ROOM_SUCCESS_PACKET] ");
 	auto user = recvPkt.user();
+	if (!user)
+	{
+		return false;
+	}
+	auto& roomState = GLOBAL(LobbyClientState);
+	roomState.ResetRoom(MakeParticipantView(*user));
 	// GLOBAL(SceneGlobal).SetLocalNetworkID(user->id());
 	GLOBAL(SceneGlobal).SetSessionID(user->id());
 
@@ -335,35 +366,39 @@ bool NetBridge::S2C::Handle_LC_ENTER_GAME_ROOM_SUCCESS_PACKET(
 		DEBUG_LOG_FMT("User TeamType: DEFENSE\n");
 
 	auto participants = recvPkt.participants();
-	DEBUG_LOG_FMT("Current Participant Count: {}\n", participants->size());
+	DEBUG_LOG_FMT("Current Participant Count: {}\n", participants ? participants->size() : 0);
 
-	for (const auto participant : *participants)
+	if (participants)
 	{
-		DEBUG_LOG_FMT("Participant ID:{}\n", participant->id());
-		if (participant->type() == FB_ENUMS::PARTICIPANT_TYPE_USER)
+		for (const auto participant : *participants)
 		{
-			DEBUG_LOG_FMT("Participant Type: USER\n");
+			roomState.AddOrUpdateParticipant(MakeParticipantView(*participant));
+			DEBUG_LOG_FMT("Participant ID:{}\n", participant->id());
+			if (participant->type() == FB_ENUMS::PARTICIPANT_TYPE_USER)
+			{
+				DEBUG_LOG_FMT("Participant Type: USER\n");
+			}
+			else if (participant->type() == FB_ENUMS::PARTICIPANT_TYPE_HOST)
+			{
+				DEBUG_LOG_FMT("Participant Type: HOST\n");
+			}
+			else if (participant->type() == FB_ENUMS::PARTICIPANT_TYPE_BOT)
+			{
+				DEBUG_LOG_FMT("Participant Type: BOT\n");
+			}
+			if (participant->state_type() == FB_ENUMS::PARTICIPANT_STATE_TYPE_NOT_READY)
+			{
+				DEBUG_LOG_FMT("Participant State: NOT_READY\n");
+			}
+			else
+				DEBUG_LOG_FMT("Participant State: READY\n");
+			if (participant->team_type() == FB_ENUMS::TEAM_TYPE_BLUE)
+			{
+				DEBUG_LOG_FMT("Participant TeamType: BLUE\n");
+			}
+			else
+				DEBUG_LOG_FMT("Participant TeamType: RED\n");
 		}
-		else if (participant->type() == FB_ENUMS::PARTICIPANT_TYPE_HOST)
-		{
-			DEBUG_LOG_FMT("Participant Type: HOST\n");
-		}
-		else if (participant->type() == FB_ENUMS::PARTICIPANT_TYPE_BOT)
-		{
-			DEBUG_LOG_FMT("Participant Type: BOT\n");
-		}
-		if (participant->state_type() == FB_ENUMS::PARTICIPANT_STATE_TYPE_NOT_READY)
-		{
-			DEBUG_LOG_FMT("Participant State: NOT_READY\n");
-		}
-		else
-			DEBUG_LOG_FMT("Participant State: READY\n");
-		if (participant->team_type() == FB_ENUMS::TEAM_TYPE_BLUE)
-		{
-			DEBUG_LOG_FMT("Participant TeamType: BLUE\n");
-		}
-		else
-			DEBUG_LOG_FMT("Participant TeamType: RED\n");
 	}
 
 	GLOBAL(SceneGlobal).LoadScene("RoomScene");
@@ -394,6 +429,7 @@ bool NetBridge::S2C::Handle_LC_JOIN_PARTICIPANT_IN_GAME_ROOM_PACKET(
 	DEBUG_LOG_FMT("[SC_JOIN_PARTICIPANT_IN_GAME_ROOM_PACKET] ");
 	auto participant = recvPkt.participant();
 	DEBUG_LOG_FMT("Participant ID:{}\n", participant->id());
+	GLOBAL(LobbyClientState).AddOrUpdateParticipant(MakeParticipantView(*participant));
 
 	if (participant->type() == FB_ENUMS::PARTICIPANT_TYPE_USER)
 	{
@@ -432,6 +468,7 @@ bool NetBridge::S2C::Handle_LC_LEAVE_PARTICIPANT_IN_GAME_ROOM_PACKET(
 	// 게임 룸에서 참가자가 퇴장
 	DEBUG_LOG_FMT("[SC_LEAVE_PARTICIPANT_IN_GAME_ROOM_PACKET] ");
 	DEBUG_LOG_FMT("Participant ID:{} Leave Game Room!\n", recvPkt.participant_id());
+	GLOBAL(LobbyClientState).RemoveParticipant(recvPkt.participant_id());
 	return true;
 }
 
@@ -447,6 +484,7 @@ bool NetBridge::S2C::Handle_LC_READY_GAME_PACKET(const SOCKET& socket, const FB_
 	}
 	else
 		DEBUG_LOG_FMT(" Ready!\n");
+	GLOBAL(LobbyClientState).SetParticipantReady(recvPkt.user_id(), recvPkt.participant_state());
 
 	return true;
 }
@@ -458,6 +496,8 @@ bool NetBridge::S2C::Handle_LC_START_GAME_FAIL_PACKET(
 	// 게임 시작 실패
 	DEBUG_LOG_FMT("[LC_START_GAME_FAIL_PACKET] ");
 	DEBUG_LOG_FMT("Fail Reason: {}\n", recvPkt.fail_msg()->c_str());
+	GLOBAL(LobbyClientState).SetStartPending(false);
+	GLOBAL(LobbyClientState).SetStatusMessage(recvPkt.fail_msg()->str());
 
 	return true;
 }
@@ -474,6 +514,7 @@ bool NetBridge::S2C::Handle_LC_CHANGE_TEAM_PACKET(const SOCKET& socket, const FB
 	{
 		DEBUG_LOG_FMT("User ID: {} Change Team To RED\n", recvPkt.user_id());
 	}
+	GLOBAL(LobbyClientState).SetParticipantTeam(recvPkt.user_id(), recvPkt.team_type());
 	return true;
 }
 
@@ -481,7 +522,11 @@ bool NetBridge::S2C::Handle_LC_ADD_BOT_PACKET(const SOCKET& socket, const FB_TAB
 {
 	// 게임 룸에 새로운 봇이 추가됨
 	DEBUG_LOG_FMT("[LC_ADD_BOT_PACKET] ");
-	// DEBUG_LOG_FMT("Bot ID: {}, TeamType: {}\n", recvPkt.bot_id(), recvPkt.team_type());
+	GLOBAL(LobbyClientState)
+		.AddOrUpdateParticipant(
+			{recvPkt.bot_id(), FB_ENUMS::PARTICIPANT_TYPE_BOT, FB_ENUMS::PARTICIPANT_STATE_TYPE_READY,
+			 recvPkt.team_type()}
+		);
 
 	return true;
 }
@@ -490,7 +535,7 @@ bool NetBridge::S2C::Handle_LC_REMOVE_BOT_PACKET(const SOCKET& socket, const FB_
 {
 	// 게임 룸에서 봇이 제거됨
 	DEBUG_LOG_FMT("[LC_REMOVE_BOT_PACKET] ");
-	// DEBUG_LOG_FMT("Bot ID: {} Remove From Game Room!\n", recvPkt.bot_id());
+	GLOBAL(LobbyClientState).RemoveParticipant(recvPkt.bot_id());
 	return true;
 }
 
@@ -501,11 +546,17 @@ bool NetBridge::S2C::Handle_LC_CONNECT_TO_GAME_SERVER_PACKET(
 	DEBUG_LOG_FMT("Handle_LC_CON	NECT_TO_GAME_SERVER");
 	const uint32 sessionID = GLOBAL(SceneGlobal).GetSessionID();
 	const uint16 worldID{recvPkt.world_id()};
-	std::string ip{recvPkt.ip()->c_str()};
+	std::string	 ip{recvPkt.ip()->c_str()};
 	const uint16 port{recvPkt.port()};
+	GLOBAL(LobbyClientState).SetStartPending(true);
 
 	if (false == GLOBAL(NetworkGlobal).ConnectGameServer(ip.c_str(), port))
-		assert(nullptr);
+	{
+		GLOBAL(LobbyClientState).SetStartPending(false);
+		GLOBAL(LobbyClientState).SetStatusMessage("Failed to connect to game server");
+		DEBUG_LOG_FMT("[LC_CONNECT_TO_GAME_SERVER_PACKET] Failed to connect {}:{}\n", ip, port);
+		return false;
+	}
 
 	// 로비서버로부터 받은 세션 아이디
 	// TODO: 로비 서버로부터 받은 세션 아이디를 게임 서버로 전달해서 게임 서버에 입장하기
@@ -514,6 +565,7 @@ bool NetBridge::S2C::Handle_LC_CONNECT_TO_GAME_SERVER_PACKET(
 		GLOBAL(NetworkGlobal).SendGame(std::move(pb));
 	}
 
+	GLOBAL(SceneGlobal).LoadScene("LoadingScene");
 	GLOBAL(NetworkGlobal).DisconnectLobbyServer();
 	return true;
 }
@@ -571,6 +623,7 @@ bool NetBridge::S2C::Handle_SC_LOCAL_PLAYER_PACKET(
 {
 	s_latestRedScore = 0;
 	s_latestBlueScore = 0;
+	s_occupationZoneSlotByObjectID.clear();
 
 	// GLOBAL(SceneGlobal).SetLocalNetworkID(recvPkt.player_id());
 
@@ -708,9 +761,10 @@ bool NetBridge::S2C::Handle_SC_LOCAL_PLAYER_PACKET(
 
 			// Animation Component
 			scene->CreateComponentWithInit<AnimationComponent>(
-				playerObjHandle, [](AnimationComponent* anim) { AnimationLoader::AnimationApply(anim, "CursedKnight", true); }
+				playerObjHandle,
+				[](AnimationComponent* anim) { AnimationLoader::AnimationApply(anim, "CursedKnight", true); }
 			);
-			
+
 			// Foot IK Component
 			scene->CreateComponentWithInit<FootIKComponent>(playerObjHandle, [](FootIKComponent*) {});
 
@@ -852,7 +906,7 @@ bool NetBridge::S2C::Handle_SC_LOCAL_PLAYER_PACKET(
 					);
 				}*/
 
-				//scene->CreateComponentWithInit<AttackRangeDebugComponent>(
+				// scene->CreateComponentWithInit<AttackRangeDebugComponent>(
 				//	attackRangeHandle,
 				//	[](AttackRangeDebugComponent* debug)
 				//	{
@@ -966,7 +1020,8 @@ bool NetBridge::S2C::Handle_SC_ADD_OBJ_PACKET(const SOCKET& socket, const FB_TAB
 
 			auto objHandle = obj->GetHandle();
 
-			bool isGeneral = (objType == FB_ENUMS::GAME_OBJECT_TYPE_PLAYER) || objType == FB_ENUMS::GAME_OBJECT_TYPE_GENERAL;
+			bool isGeneral =
+				(objType == FB_ENUMS::GAME_OBJECT_TYPE_PLAYER) || objType == FB_ENUMS::GAME_OBJECT_TYPE_GENERAL;
 
 			// MeshComponent 또는 SkinnedMeshComponent 추가
 			if (isGeneral)
@@ -1186,7 +1241,7 @@ bool NetBridge::S2C::Handle_SC_ADD_OBJ_PACKET(const SOCKET& socket, const FB_TAB
 					);
 				}*/
 
-				//scene->CreateComponentWithInit<AttackRangeDebugComponent>(
+				// scene->CreateComponentWithInit<AttackRangeDebugComponent>(
 				//	attackRangeHandle,
 				//	[](AttackRangeDebugComponent* debug)
 				//	{
@@ -1195,7 +1250,6 @@ bool NetBridge::S2C::Handle_SC_ADD_OBJ_PACKET(const SOCKET& socket, const FB_TAB
 				//	}
 				//);
 				/////////////
-
 			}
 			else if (objType == FB_ENUMS::GAME_OBJECT_TYPE_SOLDIER) ////// Soldier
 			{
@@ -1358,14 +1412,14 @@ bool NetBridge::S2C::Handle_SC_ADD_OBJ_PACKET(const SOCKET& socket, const FB_TAB
 					);
 				}*/
 
-			/*	scene->CreateComponentWithInit<AttackRangeDebugComponent>(
-					attackRangeHandle,
-					[](AttackRangeDebugComponent* debug)
-					{
-						debug->SetRadius(1.0f);
-						debug->SetCenterAngleDegrees(10.0f);
-					}
-				);*/
+				/*	scene->CreateComponentWithInit<AttackRangeDebugComponent>(
+						attackRangeHandle,
+						[](AttackRangeDebugComponent* debug)
+						{
+							debug->SetRadius(1.0f);
+							debug->SetCenterAngleDegrees(10.0f);
+						}
+					);*/
 				////
 			}
 
@@ -1461,7 +1515,6 @@ bool NetBridge::S2C::Handle_SC_MOVE_PACKET(const SOCKET& socket, const FB_TABLES
 	const Vec3 pos{recvPkt.pos_info()->pos().x(), recvPkt.pos_info()->pos().y(), recvPkt.pos_info()->pos().z()};
 	const Vec3 rot{recvPkt.pos_info()->rot().x(), recvPkt.pos_info()->rot().y(), recvPkt.pos_info()->rot().z()};
 	auto*	   fsm = obj->GetComponent<FSMComponent>();
-	
 	// Soldier가 죽은 상태일 때는 이동 패킷을 무시
 	if (fsm &&
 		fsm->GetObjectType() == static_cast<uint8_t>(FB_ENUMS::GAME_OBJECT_TYPE_SOLDIER) &&
@@ -1469,7 +1522,7 @@ bool NetBridge::S2C::Handle_SC_MOVE_PACKET(const SOCKET& socket, const FB_TABLES
 	{
 		return true;
 	}
-	
+
 	// guard, stun dead: 이동 패킷을 무시
 	if (fsm &&
 		(fsm->GetCurStateType() == static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_GUARD) ||
@@ -1540,7 +1593,7 @@ bool NetBridge::S2C::Handle_SC_GENERAL_ATTACK_PACKET(
 	}
 
 	// 1. 공격자 오브젝트 찾기
-		if (auto* obj = scene->FindGameObjectByServerID(id))
+	if (auto* obj = scene->FindGameObjectByServerID(id))
 	{
 		// 2. 컴포넌트 가져오기
 		if (auto* uiController = obj->GetComponent<BattleUIControllerComponent>())
@@ -1558,12 +1611,11 @@ bool NetBridge::S2C::Handle_SC_GENERAL_ATTACK_PACKET(
 					fsm->ChangeState(FB_ENUMS::PLAYER_STATE_TYPE_PRE_DELAY);
 				}
 			}
-			return true;
-
 			// UI 갱신
 			uiController->TriggerAttackRemote(type, dir);
 			// DEBUG_LOG_FMT("[SC_PLAYER_ATTACK] ID: {}, Type: {}, Dir: {}\n", id, static_cast<int>(type),
 			// static_cast<int>(dir));
+			return true;
 		}
 	}
 
@@ -1633,7 +1685,7 @@ bool NetBridge::S2C::Handle_SC_CHANGE_GENERAL_STANCE_PACKET(
 			{
 				cameraComp->SetLookAtTarget(localPlayer->GetHandle());
 				cameraComp->SetLookAtTargetOffset({0.0f, 0.0f, 0.0f}); // 오프셋 초기화
-				cameraComp->SetEnableLookAtRotation(false); // 자유 시점
+				cameraComp->SetEnableLookAtRotation(false);			   // 자유 시점
 				cameraComp->SetFollowOffsetLocal(
 					{CameraConfig::kDefaultLocalOffsetX, CameraConfig::kCameraHeight, CameraConfig::kDefaultLocalOffsetZ
 					}
@@ -1652,7 +1704,8 @@ bool NetBridge::S2C::Handle_SC_CHANGE_GENERAL_STANCE_PACKET(
 			if (auto targetObj = scene->FindGameObjectByServerID(cameraTargetID))
 			{
 				cameraComp->SetLookAtTarget(targetObj->GetHandle());
-				cameraComp->SetLookAtTargetOffset({0.0f, CameraConfig::kLockOnViewOffsetY, 0.0f}); // 대상을 바라볼 때 약간 위를 바라보도록 설정
+				cameraComp->SetLookAtTargetOffset({0.0f, CameraConfig::kLockOnViewOffsetY, 0.0f}
+				);										   // 대상을 바라볼 때 약간 위를 바라보도록 설정
 				cameraComp->SetEnableLookAtRotation(true); // 락온 시에 회전 고정
 				DEBUG_LOG_FMT("[SC_CHANGE_CAMERA_TARGET_PACKET] Camera Target Set to ID: {}\n", cameraTargetID);
 			}
@@ -1710,18 +1763,20 @@ bool NetBridge::S2C::Handle_SC_UPDATE_STATE_PACKET(
 	// FSM 상태 동기화
 	if (auto* fsm = obj->GetComponent<FSMComponent>())
 	{
-		//DEBUG_LOG_FMT(
+		// DEBUG_LOG_FMT(
 		//	"[RemoteState] objID={}, received={}, before={}\n",
 		//	objID,
 		//	static_cast<int>(nextState),
 		//	static_cast<int>(fsm->GetCurStateType())
 		//);
 
-		if (fsm->GetObjectType() == static_cast<uint8_t>(FB_ENUMS::GAME_OBJECT_TYPE_SOLDIER) && nextState == FB_ENUMS::SOLDIER_STATE_TYPE_ATTACK)
+		if (fsm->GetObjectType() == static_cast<uint8_t>(FB_ENUMS::GAME_OBJECT_TYPE_SOLDIER) &&
+			nextState == FB_ENUMS::SOLDIER_STATE_TYPE_ATTACK)
 		{
 			return true;
 		}
-		if (fsm->GetObjectType() == static_cast<uint8_t>(FB_ENUMS::GAME_OBJECT_TYPE_GENERAL) && nextState == FB_ENUMS::GENERAL_STATE_TYPE_ATTACK)
+		if (fsm->GetObjectType() == static_cast<uint8_t>(FB_ENUMS::GAME_OBJECT_TYPE_GENERAL) &&
+			nextState == FB_ENUMS::GENERAL_STATE_TYPE_ATTACK)
 		{
 			return true;
 		}
@@ -1740,7 +1795,7 @@ bool NetBridge::S2C::Handle_SC_UPDATE_STATE_PACKET(
 			}
 		}
 		fsm->SetServerState(nextState);
-		//DEBUG_LOG_FMT(
+		// DEBUG_LOG_FMT(
 		//	"[RemoteState] objID={}, after={}\n",
 		//	objID,
 		//	static_cast<int>(fsm->GetCurStateType())
@@ -1810,7 +1865,7 @@ bool NetBridge::S2C::Handle_SC_CHANGE_CAMERA_TARGET_PACKET(
 		{
 			cameraComp->SetLookAtTarget(localPlayer->GetHandle());
 			cameraComp->SetLookAtTargetOffset({0.0f, 0.0f, 0.0f}); // 오프셋 초기화
-			cameraComp->SetEnableLookAtRotation(false); // 자유 시점
+			cameraComp->SetEnableLookAtRotation(false);			   // 자유 시점
 			cameraComp->SetFollowOffsetLocal(
 				{CameraConfig::kDefaultLocalOffsetX, CameraConfig::kCameraHeight, CameraConfig::kDefaultLocalOffsetZ}
 			); // 오프셋 복구 (공유 상수 사용)
@@ -2026,7 +2081,7 @@ bool NetBridge::S2C::Handle_SC_GENERAL_GUARD_PACKET(
 		return true;
 	}
 
-	const uint8_t attackerState = attackerFsm->GetCurStateType();	
+	const uint8_t attackerState = attackerFsm->GetCurStateType();
 	// 공격자가 선딜이거나 attack 일 때만 guard 정정 적용
 	if (attackerState != static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_PRE_DELAY) &&
 		attackerState != static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_ATTACK))
@@ -2040,8 +2095,7 @@ bool NetBridge::S2C::Handle_SC_GENERAL_GUARD_PACKET(
 		{
 			fsm->SetGuardRole(FSMComponent::GuardRole::Defender);
 			fsm->RequestState(
-				FSMComponent::StateRequestType::Guard,
-				static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_GUARD)
+				FSMComponent::StateRequestType::Guard, static_cast<uint8_t>(FB_ENUMS::PLAYER_STATE_TYPE_GUARD)
 			);
 		}
 	}
@@ -2102,9 +2156,21 @@ bool NetBridge::S2C::Handle_SC_OCCUPATION_ZONE_GAUGE_PACKET(
 		return false;
 	}
 
-	const float gauge = std::clamp(recvPkt.occupy_gauge(), -100.0f, 100.0f);
-	const float blueAmount = std::max(-gauge, 0.0f) / 100.0f;
-	const float redAmount = std::max(gauge, 0.0f) / 100.0f;
+	const float	 gauge = std::clamp(recvPkt.occupy_gauge(), -100.0f, 100.0f);
+	const float	 blueAmount = std::max(-gauge, 0.0f) / 100.0f;
+	const float	 redAmount = std::max(gauge, 0.0f) / 100.0f;
+	const uint64 zoneID = recvPkt.obj_id();
+	auto		 slotIter = s_occupationZoneSlotByObjectID.find(zoneID);
+	if (slotIter == s_occupationZoneSlotByObjectID.end())
+	{
+		if (s_occupationZoneSlotByObjectID.size() >= 2)
+		{
+			return false;
+		}
+		const uint8 slot = static_cast<uint8>(s_occupationZoneSlotByObjectID.size());
+		slotIter = s_occupationZoneSlotByObjectID.emplace(zoneID, slot).first;
+	}
+	const bool useSecondSlot = slotIter->second == 1;
 
 	for (auto& rect : scene->GetStorage<RectTransformComponent>()->GetList())
 	{
@@ -2114,13 +2180,13 @@ bool NetBridge::S2C::Handle_SC_OCCUPATION_ZONE_GAUGE_PACKET(
 			continue;
 		}
 
-		if (owner->GetName() == "OccupationGaugeBlue")
+		if (owner->GetName() == (useSecondSlot ? "OccupationGaugeBlueB" : "OccupationGaugeBlue"))
 		{
 			rect.SetAnchors({0.5f - 0.5f * blueAmount, 0.0f}, {0.5f, 1.0f});
 			rect.SetOffsetMin({0.0f, 2.0f});
 			rect.SetOffsetMax({0.0f, -2.0f});
 		}
-		else if (owner->GetName() == "OccupationGaugeRed")
+		else if (owner->GetName() == (useSecondSlot ? "OccupationGaugeRedB" : "OccupationGaugeRed"))
 		{
 			rect.SetAnchors({0.5f, 0.0f}, {0.5f + 0.5f * redAmount, 1.0f});
 			rect.SetOffsetMin({0.0f, 2.0f});
@@ -2130,4 +2196,3 @@ bool NetBridge::S2C::Handle_SC_OCCUPATION_ZONE_GAUGE_PACKET(
 
 	return true;
 }
-
