@@ -25,6 +25,7 @@
 #include "Component/HealthComponent.h"
 #include "Component/BattleUIControllerComponent.h"
 #include "Component/World/QuestProgressComponent.h"
+#include "Component/World/WorldSceneControllerComponent.h"
 #include "Util/CameraConfig.h"
 #include "Component/TeamComponent.h"
 #include "Component/VitalUIControllerComponent.h"
@@ -122,6 +123,22 @@ TextUIComponent* FindRemainingTimeText(Scene* scene)
 	}
 
 	return nullptr;
+}
+
+WorldSceneControllerComponent* FindWorldSceneController(Scene* scene)
+{
+	if (!scene)
+	{
+		return nullptr;
+	}
+
+	auto* storage = scene->GetStorage<WorldSceneControllerComponent>();
+	if (!storage || storage->GetList().empty())
+	{
+		return nullptr;
+	}
+
+	return &*storage->GetList().begin();
 }
 } // namespace
 
@@ -2014,6 +2031,10 @@ bool NetBridge::S2C::Handle_SC_UPDATE_TEAM_SCORE_PACKET(
 {
 	s_latestBlueScore = recvPkt.blue_score();
 	s_latestRedScore = recvPkt.red_score();
+	if (auto* controller = FindWorldSceneController(GLOBAL(SceneGlobal).GetActiveScene()))
+	{
+		controller->SetTeamScores(s_latestBlueScore, s_latestRedScore);
+	}
 	std::cout << std::format("Blue Team: {}, Red Team: {}\n", recvPkt.blue_score(), recvPkt.red_score()) << std::endl;
 	return true;
 }

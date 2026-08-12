@@ -525,8 +525,8 @@ void WorldScene::OnStartImpl()
 				{
 					rect->SetAnchors({0.5f, 0.0f}, {0.5f, 0.0f});
 					rect->SetPivot({0.5f, 0.0f});
-					rect->SetOffsetMin({-120.0f, 16.0f});
-					rect->SetOffsetMax({120.0f, 60.0f});
+					rect->SetOffsetMin({-120.0f, 66.0f});
+					rect->SetOffsetMax({120.0f, 110.0f});
 				}
 			);
 
