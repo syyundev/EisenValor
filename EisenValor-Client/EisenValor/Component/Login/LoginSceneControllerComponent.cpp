@@ -4,6 +4,7 @@
 #include "AudioGlobal.h"
 #include "NetworkGlobal.h"
 #include "Packets/C2SPackets.h"
+#include "Util/GameConstants.h"
 
 namespace
 {
@@ -144,7 +145,8 @@ LRESULT CALLBACK LoginDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
 		const int controlID = LOWORD(wParam);
 		if (controlID == kLoginButtonID || controlID == kRegisterButtonID || controlID == kCancelButtonID)
 		{
-			GLOBAL(AudioGlobal).Play2D(L"Resource/Sounds/click.wav", AudioBus::UI);
+			GLOBAL(AudioGlobal)
+				.Play2D(L"Resource/Sounds/click.wav", AudioBus::UI, false, AudioBalance::kUIButtonVolume);
 		}
 
 		if (controlID == kLoginButtonID)

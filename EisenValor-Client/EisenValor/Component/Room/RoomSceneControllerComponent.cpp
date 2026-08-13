@@ -8,6 +8,7 @@
 #include "Packets/C2SPackets.h"
 #include "Scene.h"
 #include "TextUIComponent.h"
+#include "Util/GameConstants.h"
 
 namespace
 {
@@ -201,7 +202,9 @@ void RoomSceneControllerComponent::OnUpdate(float deltaTime)
 			button->SetOnClick(
 				[participantID]()
 				{
-					GLOBAL(AudioGlobal).Play2D(L"Resource/Sounds/mouseclick.wav", AudioBus::UI, false, 0.05f);
+					GLOBAL(AudioGlobal).Play2D(
+						L"Resource/Sounds/mouseclick.wav", AudioBus::UI, false, AudioBalance::kUIButtonVolume
+					);
 					auto pb{NetBridge::C2S::Make_CL_REMOVE_BOT_PACKET(participantID)};
 					GLOBAL(NetBridge::NetworkGlobal).Send(std::move(pb));
 				}
